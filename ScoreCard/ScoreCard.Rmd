@@ -1,0 +1,561 @@
+---
+title: "信用评分卡模型"
+author: "Wison Hang"
+date: "2020/3/5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+ref https://www.jianshu.com/p/4c55fa92a9ac
+
+https://www.cnblogs.com/daliner/p/10268350.html
+
+## 一、数据获取
+
+1.数据描述
+数据属于个人消费类贷款，只考虑评分卡最终实施时能够使用到的数据应从如下一些方面获取数据：
+  
+  基本属性：包括了借款人当时的年龄。
+  
+  偿债能力：包括了借款人的月收入、负债比率。
+  
+  信用往来：两年内35-59天逾期次数、两年内60-89天逾期次数、两年内90天或高于90天逾期的次数。
+  
+  财产状况：包括了开放式信贷和贷款数量、不动产贷款或额度数量。
+  
+  贷款属性：暂无。
+  
+  其他因素：包括了借款人的家属数量（不包括本人在内）。
+```{r pressure, echo=FALSE, out.width = '100%'}
+knitr::include_graphics("https://upload-images.jianshu.io/upload_images/7744536-11bd43ba74266260.png")
+```
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DT)
+library(data.table)
+train_data<-read_csv('cs_training.csv')[,-1]
+test_data<-read_csv('cs_test.csv')[,-1]
+col_name=c('SeriousDlqin2yrs'='好坏客户',
+        'RevolvingUtilizationOfUnsecuredLines'='可用额度比值',
+        'age'='年龄',
+        'NumberOfTime30-59DaysPastDueNotWorse'='逾期30-59天笔数',
+        'DebtRatio'='负债率',
+        'MonthlyIncome'='月收入',
+        'NumberOfOpenCreditLinesAndLoans'='信贷数量',
+        'NumberOfTimes90DaysLate'='逾期90天笔数',
+        'NumberRealEstateLoansOrLines'='固定资产贷款量',
+        'NumberOfTime60-89DaysPastDueNotWorse'='逾期60-89天笔数',
+        'NumberOfDependents'='家属数量')
+
+colnames(test_data)=colnames(train_data)=as.character(col_name)
+summary(train_data)
+```
+## 二、数据预处理
+
+·缺失值处理
+
+·异常值处理
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=4}
+#缺失值比率
+napct=(colSums(is.na(train_data))/dim(train_data)[1])%>%scales::percent(accuracy = .1)
+formattable::formattable(as.data.frame(napct))
+
+
+# yuqi<-train_data[,c("逾期30-59天笔数","逾期60-89天笔数","逾期90天笔数")]%>%gather(key='type')
+
+par(mfrow=c(1,2))
+boxplot(value~type,data=train_data[,c("逾期30-59天笔数","逾期60-89天笔数","逾期90天笔数")]%>%gather(key='type')
+        ,main='逾期情况箱线图')
+
+boxplot(train_data$年龄,main='年龄箱线图')
+
+par(mfrow=c(1,2))
+boxplot(value~type,data=train_data[,c("可用额度比值","负债率")]%>%gather(key='type'),
+        main='额度&负债'
+        )
+boxplot(value~type,data=train_data[,c("信贷数量","固定资产贷款量")]%>%gather(key='type'),
+        main='信贷&固贷款'
+        )
+```
+
+缺失值处理：
+月收入缺失较大，使用平均值进行填充，家属数量缺失较少，将缺失的删掉，另外，如果字段缺失过大，将失去分析意义，可以将整个字段删除
+
+异常值处理：消除不合逻辑的数据和超级离群的数据，
+
+可用额度比值和负债率应该小于1，年龄小于0的是异常值，逾期天数笔数大于80的是超级离群数据，固定资产贷款量大于50的是超级离群数据，将这些离群值过滤掉，筛选出剩余部分数据。
+
+月收入大于50万的是离群值，采用盖帽法，即用数据分布在1%的数据覆盖在1%以下的数据，用在99%的数据覆盖99%以上的数据。
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+block<-function(x,lower=T,upper=T){
+  if(lower){
+    q1<-quantile(x,0.01)
+    x[x<=q1]<-q1
+  }
+  if(upper){
+    q99<-quantile(x,0.99)
+    x[x>q99]<-q99
+  }
+  return(x)
+}
+
+train_data<- train_data%>%mutate(
+  月收入=if_else(is.na(月收入),mean(月收入,na.rm=T),月收入),
+  月收入=block(月收入)
+)%>%filter(!is.na(家属数量) & 可用额度比值<=1 & 负债率<=1&年龄>0 &逾期90天笔数<80&固定资产贷款量<50)
+
+```
+
+## 三、探索性分析切分数据集
+
+在建立模型之前，我们一般会对现有的数据进行 探索性数据分析（Exploratory Data Analysis） 。 EDA是指对已有的数据(特别是调查或观察得来的原始数据)在尽量少的先验假定下进行探索。常用的探索性数据分析方法有：直方图、散点图和箱线图等。探索数据主要是为了分析各变量对输出结果的影响，在本项目中，主要关注的是违约客户与各变量间的关系。
+
+1.单变量分析
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=8}
+library(gridExtra)
+
+
+var_list=c("年龄","可用额度比值","月收入" ,"逾期30-59天笔数" ,"逾期60-89天笔数","逾期90天笔数",
+        "信贷数量","固定资产贷款量","家属数量")
+
+gg=lapply(var_list,function(x){var_n=sym(x)
+ggplot(train_data, aes(x = !!var_n, y = ..density..)) + geom_histogram(fill = "blue", colour = "grey60", size = 0.2, alpha = 0.2,bins = 30) + geom_density()})
+
+grid.arrange(arrangeGrob(grobs=gg,layout=matrix(c(1,2,3,4,5,6,7,8,9),nrow=3,byrow = T)))
+
+train_data%>%mutate(age_range=cut(年龄,breaks=5))%>%
+  group_by(age_range)%>%summarise(
+    好客户=sum(好坏客户==0),
+    坏客户=sum(好坏客户==1),
+    坏客户占比=(坏客户/n())%>%scales::percent(accuracy = .01)
+    )%>%knitr::kable(caption = '违约客户年龄分箱')
+
+
+train_data%>%mutate(salary_range=cut(月收入,breaks=5))%>%
+  group_by(salary_range)%>%summarise(
+    好客户=sum(好坏客户==0),
+    坏客户=sum(好坏客户==1),
+    坏客户占比=(坏客户/n())%>%scales::percent(accuracy = .01)
+    )%>%knitr::kable(caption = '违约客户月收入分箱')
+```
+
+年龄和收入符合正太分布，
+
+2.多变量分析
+
+我们会用经过清洗后的数据看一下变量间的相关性。注意，这里的相关性分析只是初步的检查，进一步检查模型的IV（证据权重）作为变量筛选的依据。此处较简单，在此不赘述。
+
+总之，数据处理的过程是占据整个标准评分卡构建的最大的工作量，整体的目标是：排除异常值对模型训练的干扰，将所有变量进行量化处理，自变量对因变量有明显的解释性，变量之间无明显相关性。
+
+建模之前需要先检验变量之间的相关性,,如果变量之间具有强相关性,则会影响模型的准确性.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=8} 
+library(corrplot)
+corrplot.mixed(cor(train_data[,c(var_list,'负债率')],use='pairwise.complete.ob'),tl.pos = "lt", diag = "u")
+```
+
+由上图可知:各个变量之间的相关系数较小,相关性较弱,不存在明显的多重共线问题,采用logistic回归需要考虑多重共线问题,不过此处由于各变量之间的相关性较小,可以初步判断不存在多重共线问题.在建模之后也可以通过VIF(方差膨胀因子)来检验多重共线问题.如果存在多重共线性，即有可能存在两个变量高度相关，需要降维或剔除处理,需要进行降维或剔除处理.
+
+## 切分数据集
+
+采用SMOTE算法，smote算法的思想是合成新的少数类样本，合成的策略是对每个少数类样本a，从它的最近邻中随机选一个样本b，然后在a、b之间的连线上随机选一点作为新合成的少数类样本。
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+library(caret)
+set.seed(1234) 
+splitIndex<-createDataPartition(train_data$好坏客户,time=1,p=0.8,list=FALSE) 
+train<-train_data[splitIndex,] 
+test<-train_data[-splitIndex,]
+prop.table(table(train$好坏客户))
+prop.table(table(test$好坏客户))
+```
+
+
+## 四、建立模型
+
+Logistic回归在信用评分卡开发中起到核心作用。由于其特点，以及对自变量进行了证据权重转换（WOE），Logistic回归的结果可以直接转换为一个汇总表，即所谓的标准评分卡格式。
+
+```{r , echo=FALSE, out.width = '120%'}
+knitr::include_graphics("https://upload-images.jianshu.io/upload_images/15866579-aa9316d919c1bdfb.png?imageMogr2/auto-orient/strip|imageView2/2/format/webp")
+```
+
+
+## 特征变量选择
+
+特征选择非常重要，好的特征能够构造出较好的模型，在此，我们采用信用卡评分模型常用的IV值筛选。
+
+1.特征分箱
+特征分箱指的是将连续变量离散化或将多状态的离散变量合并成少状态。离散特征的增加和减少都很容易，易于模型的快速迭代，离散化后的特征对异常数据有很强的鲁棒性，能够减少未离散化之前异常值对模型的干扰，同时离散化后可以进行特征交叉。此外本文所选的模型算法为逻辑回归，逻辑回归属于广义线性模型，表达能力受限；单变量离散化为N个后，每个变量有单独的权重，相当于为模型引入非线性，提升模型表达能力，加大拟合，同时也降低了模型过拟合的风险。
+
+特征分箱常用的有以下几种方法：有监督的有Best-KS，ChiMerge（卡分分箱），无监督的包括等频、等距、聚类。根据数据特征，针对不同数据采用不同分箱方式。
+
+信用评分卡开发中一般有常用的等距分段、等深分段、最优分段。
+
+如年龄，在外面的业务场景中年龄越小和年龄越大，违约概率都会偏大，所以这块需要做好分箱处理。
+
+按照woe的单调性进行调整，保持单调性可以使连续数据转化为离散时数据之间能有一定的联系和趋势而不是孤立的几个数据（另外单调从系数的正负上也反映的单变量对结果的影响趋势），当然woe不一定保证完全单调递增或递减，保持一定趋势即可，这种趋势一般不会发生完全逆转。
+
+```{r woe, echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=8}
+
+cut1_bins=c(-1,0.25,0.5,0.75,1)
+cut2_bins=c(20,30,35,45,50,60,70,Inf)
+cut3_bins=c(-1,0,1,2.5,4,Inf)
+cut4_bins=c(-1,0.3,0.6,1)
+cut5_bins=c(-1,5000,8000,18000,Inf)
+cut6_bins=c(-1,5,10,40,Inf)
+cut7_bins=c(-1,0,1,2.5,5,Inf)
+cut8_bins=c(-1,0,1,3,Inf)
+cut9_bins=c(-1,0,1,2.5,Inf)
+cut10_bins=c(-1,0,1,2,3,5,Inf)
+
+cut1=cut(train$可用额度比值,cut1_bins)
+cut2=cut(train$年龄,cut2_bins)
+cut3=cut(train$`逾期30-59天笔数`,cut3_bins)
+cut4=cut(train$负债率,cut4_bins)
+cut5=cut(train$月收入,cut5_bins)
+cut6=cut(train$信贷数量,cut6_bins)
+cut7=cut(train$逾期90天笔数,cut7_bins)
+cut8=cut(train$固定资产贷款量,cut8_bins)
+cut9=cut(train$`逾期60-89天笔数`,cut9_bins)
+cut10=cut(train$家属数量,cut10_bins)
+
+rate=sum(train$好坏客户)/(length(train$好坏客户)-sum(train$好坏客户))
+
+
+get_woe<-function(cut_id){
+  temp=train%>%group_by(get(cut_id))%>%summarise('0'=length(好坏客户)-sum(好坏客户),
+                                        '1'=sum(好坏客户)
+  )
+  woe=data.frame(
+    rowname=as.factor(temp[,1,drop=T]),
+    woe=log(temp[,3,drop=T]/temp[,2,drop=T]/(rate)))
+  #rownames(woe)=temp[,1,drop=T]
+  woe
+}
+
+cut_woe=lapply(seq(1,10),function(x){get_woe(paste0('cut',x))})
+woe_plot<-lapply(seq(1,10),function(x){
+  cut_woe[[x]]%>%ggplot()+geom_bar(aes(x=rowname,y=woe),stat='identity',fill='lightgreen')+
+  xlab(colnames(train)[x+1])
+})
+
+grid.arrange(arrangeGrob(grobs=woe_plot,layout=matrix(c(1,2,3,4,5,6,7,8,9,10),nrow=3,byrow = T)))
+
+```
+
+2.IV值计算
+
+```{r IV, echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=4}
+get_iv<-function(cut_id){
+    temp=train%>%group_by(get(cut_id))%>%summarise('0'=length(好坏客户)-sum(好坏客户),
+                                        '1'=sum(好坏客户)
+  )
+  iv=sum(log(temp[,3,drop=T]/temp[,2,drop=T]/(rate))*(temp[,3,drop=T]/sum(temp[,3])-temp[,2,drop=T]/sum(temp[,2])))
+}
+IV=data.frame(
+  factor=factor(colnames(train)[-1],levels = colnames(train)[-1]),
+  iv=lapply(seq(1,10),function(x){get_iv(paste0('cut',x))})%>%unlist())
+
+ggplot(IV)+geom_bar(aes(x=factor,y=iv),stat='identity',fill='lightblue')
+knitr::kable(IV)
+```
+
+一般选取IV大于0.02的特征变量进行后续训练，从以上可以看出所有变量均满足
+
+
+## Base Logistic model
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=6}
+
+
+lr_fit<-glm(好坏客户~.,train,family = "binomial")
+summary(lr_fit)
+
+###逐步剔除变量
+step(lr_fit, direction = "both")
+
+##  VIF 多重共线性
+# library(car)
+# library(carData)
+# vif(fit)
+
+lr_prob <- predict(lr_fit, test,type="response")
+
+### predict type = response 给出具体的预测概率，而 type = class按规定的阙值给出分类
+
+library(pROC)
+lr_roc <- roc(test$好坏客户,lr_prob)
+
+## False positive rate=1-Specificity 
+## True positive rate = Sensitivity
+## True negative rate = Specificity
+
+plot(lr_roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+
+
+
+```
+
+## Woe encode Logistic
+
+
+```{r woe_encode, echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=6}
+# names(cut_woe)=colnames(train)[-1]
+
+train_cut=data.frame(
+cut1=cut(train$可用额度比值,cut1_bins),
+cut2=cut(train$年龄,cut2_bins),
+cut3=cut(train$`逾期30-59天笔数`,cut3_bins),
+cut4=cut(train$负债率,cut4_bins),
+cut5=cut(train$月收入,cut5_bins),
+# cut6=cut(train$信贷数量,cut6_bins),
+cut7=cut(train$逾期90天笔数,cut7_bins),
+cut8=cut(train$固定资产贷款量,cut8_bins),
+cut9=cut(train$`逾期60-89天笔数`,cut9_bins),
+cut10=cut(train$家属数量,cut10_bins),stringsAsFactors = F)
+
+test_cut=data.frame(
+cut1=cut(test$可用额度比值,cut1_bins),
+cut2=cut(test$年龄,cut2_bins),
+cut3=cut(test$`逾期30-59天笔数`,cut3_bins),
+cut4=cut(test$负债率,cut4_bins),
+cut5=cut(test$月收入,cut5_bins),
+# cut6=cut(test$信贷数量,cut6_bins),
+cut7=cut(test$逾期90天笔数,cut7_bins),
+cut8=cut(test$固定资产贷款量,cut8_bins),
+cut9=cut(test$`逾期60-89天笔数`,cut9_bins),
+cut10=cut(test$家属数量,cut10_bins),stringsAsFactors = F)
+
+
+cut_woe=lapply(seq(1,10),function(x){get_woe(paste0('cut',x))})
+cut_woe[[6]]=NULL
+
+col_name=colnames(train)[-c(1,7)]
+
+train_new=do.call(cbind,lapply(1:9,function(x){
+  temp=train_cut[,x,drop=F]
+  colnames(temp)='var'
+  temp=temp%>%left_join(cut_woe[[x]],by=c('var'='rowname'))%>%select(woe)
+  colnames(temp)=col_name[x]
+  temp
+  }))
+
+
+test_new=do.call(cbind,lapply(1:9,function(x){
+  temp=test_cut[,x,drop=F]
+  colnames(temp)='var'
+  temp=temp%>%left_join(cut_woe[[x]],by=c('var'='rowname'))%>%select(woe)
+  colnames(temp)=col_name[x]
+  temp
+  }))
+
+train_new$y=train$好坏客户
+test_new$y=test$好坏客户
+
+
+woelr_fit<-glm(y~.,train_new,family = "binomial")
+summary(woelr_fit)
+
+woelr_prob <- predict(woelr_fit, test_new,type="response")
+woelr_roc <- roc(test_new$y,woelr_prob)
+plot(woelr_roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+
+
+```
+
+## 模型结果转评分
+```{r echo=FALSE, out.width = '120%'}
+knitr::include_graphics("https://upload-images.jianshu.io/upload_images/15866579-d32e18ab6bfd66f9.png?imageMogr2/auto-orient/strip|imageView2/2")
+
+```
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=4}
+get_score<-function(i,x){
+  score=round(p*as.numeric(coe[i])*x,0)
+}
+
+#假设好坏比为20的时候分数为600分，每高20分好坏比翻一倍
+p <- 20/log(2)
+q <- 600-20*log(20)/log(2)
+
+coe=woelr_fit$coefficients[-1]
+score_card=lapply(1:9,function(x){
+  temp=get_score(x,cut_woe[[x]][,2])
+  names(temp)=cut_woe[[x]][,1]
+  temp
+})
+
+names(score_card)=col_name
+score_card
+```
+
+### 计算用户评分,分数越低违约概率越高
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=4}
+train[1,-1]%>%knitr::kable()
+train_cut[1,]%>%knitr::kable()
+
+#user_cut=train_cut[1,]
+user_score<-function(user_cut){
+  user_cut=as.list(user_cut)
+  q-sum(unlist(lapply(1:9,function(x){score_card[[x]][user_cut[[x]]]})))
+}
+user_score(train_cut[1,])
+
+```
+
+
+## CART 模型
+
+```{r CART,echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=6}
+library(rpart)
+library(rpart.plot)
+cart_fit=rpart(好坏客户~.,data=train)
+cart_prob <- predict(cart_fit, test)
+cart_roc <- roc(test_new$y,cart_prob)
+plot(cart_roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+
+
+rpart.plot(cart_fit,branch.type=5, type=2, extra=1,
+            main = "信用评分决策树",
+                            under = F,
+                            fallen.leaves = F,
+                            shadow.col="gray",
+                            branch.lty = 2,
+                            box.palette = "GnRd",
+                            split.col="red",
+                            cex =1
+                 )
+```
+
+
+## Xgboost 模型
+https://cran.r-project.org/web/packages/xgboost/vignettes/xgboostPresentation.html
+
+```{r xgboost,echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=6}
+library(xgboost)
+
+xgb_data=train%>%select(-好坏客户)%>%as.matrix()
+xgb_test=test%>%select(-好坏客户)%>%as.matrix()
+dtrain <- xgb.DMatrix(data = xgb_data, label=train$好坏客户)
+dtest <- xgb.DMatrix(data = xgb_test,label=test$好坏客户)
+watchlist <- list(train = dtrain, eval = dtest)
+
+params=list(
+  eta = 0.1,
+  max_depth = 4,#This should be between 3-10. 4-6 can be good starting points
+  nround=25,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  seed = 1,
+  # eval_metric = "logloss",
+  objective = "binary:logistic",
+  # num_class = 4,
+  nthread = 3,
+  lambda=0.5
+  # verbose=0
+  )
+
+fit.xgb=xgb.train(data = dtrain, watchlist = watchlist,params = params,nrounds = 10,verbose = 1)
+
+xgb_prob=predict(fit.xgb,dtest)
+xgb_roc <- roc(test$好坏客户,xgb_prob)
+plot(xgb_roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+
+importance <- xgb.importance(feature_names = colnames(xgb_data), model = fit.xgb)
+
+xgb.plot.importance(importance_matrix = importance,xlab = "Relative importance")
+```
+
+## Xgboost+LR
+https://blog.csdn.net/m0_37660800/article/details/78624492
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=6}
+
+new.features.train <- xgb.create.features(model = fit.xgb, xgb_data) # 生成xgboost构造的新特征组合，训练集
+new.features.test <- xgb.create.features(model = fit.xgb, xgb_test) # 生成xgboost构造的新特征组合，测试集
+
+newdtrain <- as.data.frame(as.matrix(new.features.train))%>%cbind(train[,'好坏客户',drop=F]) # 将训练集的特征组合转化为dataframe格式
+newdtest <- as.data.frame(as.matrix(new.features.test)) 
+
+xgboost.lr_fit=glm(好坏客户~.,newdtrain,family = "binomial")
+xgblr_prob=predict(xgboost.lr_fit,newdtest,type="response")
+
+xgblr_roc <- roc(test$好坏客户,xgblr_prob)
+plot(xgblr_roc, print.auc=TRUE, auc.polygon=TRUE, grid=c(0.1, 0.2),
+     grid.col=c("green", "red"), max.auc.polygon=TRUE,
+     auc.polygon.col="skyblue", print.thres=TRUE)
+```
+
+
+
+## 模型比较
+
+```{r , echo=FALSE, out.width = '120%'}
+knitr::include_graphics("https://img-blog.csdnimg.cn/20190822214657306.png")
+```
+
+
+$$Sensitivity=Recall=TP/P=TP/(TP+FN)$$ 
+
+$$Specificity=TN/N=TN/(FP+TN)$$ 
+
+
+$$Precision=TP/(TP+FP)$$ 
+
+$$Accuracy=(TP+TN)/(TP+TN+FP+FN)$$
+
+$$Prevalence=(A+C)/(A+B+C+D)$$ 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE,fig.width=12,fig.height=4 }
+
+plot.roc(test$好坏客户,lr_prob,main="Model comparison", percent=TRUE, col="yellow")
+lines.roc(test$好坏客户,woelr_prob,percent=TRUE, col="red")
+lines.roc(test$好坏客户,cart_prob,percent=TRUE,col="skyblue")
+lines.roc(test$好坏客户,xgb_prob,percent=TRUE,col="lightgreen")
+lines.roc(test$好坏客户,xgblr_prob,percent=TRUE,col='purple')
+legend("bottomright", legend=c("LR", "WOE-LR",'CART','Xgboost','xgboost+LR'), 
+       col=c("yellow", "red","skyblue","lightgreen",'purple'), 
+       lwd=2)
+
+
+model_thresh=c(coords(lr_roc, "best", ret=c("threshold", "specificity", "1-npv"),transpose = T)[1],
+coords(woelr_roc, "best", ret=c("threshold", "specificity", "1-npv"),transpose = T)[1],
+coords(cart_roc, "best", ret=c("threshold", "specificity", "1-npv"),transpose = T)[1],
+coords(xgb_roc, "best", ret=c("threshold", "specificity", "1-npv"),transpose = T)[1],
+coords(xgblr_roc, "best", ret=c("threshold", "specificity", "1-npv"),transpose = T)[1])
+
+cfMatrix=confusionMatrix(table(if_else(lr_prob>model_thresh[1],1,0),test$好坏客户))$overall%>%round(4)%>%rbind(
+confusionMatrix(table(if_else(woelr_prob>model_thresh[2],1,0),test$好坏客户))$overall%>%round(4))%>%rbind(
+confusionMatrix(table(if_else(cart_prob>model_thresh[3],1,0),test$好坏客户))$overall%>%round(4))%>%rbind(
+confusionMatrix(table(if_else(xgb_prob>model_thresh[4],1,0),test$好坏客户))$overall%>%round(4))%>%rbind(
+confusionMatrix(table(if_else(xgblr_prob>model_thresh[5],1,0),test$好坏客户))$overall%>%round(4))
+
+
+cfMatrix=data.frame(cfMatrix)
+rownames(cfMatrix)=c("LR", "WOE-LR",'CART','Xgboost','xgboost+LR')
+cfMatrix[,-c(6,7)]%>%DT::datatable(style = "bootstrap4",
+                  class = "cell-border stripe",
+                  options = list(dom='Bt',
+                                 columnDefs = list(list(className = 'dt-center',targets = '_all')
+                    )))%>%formatPercentage(1:7,digits = 2)
+# cfMatrix[,-c(6,7)]%>%knitr::kable(align = 'l')
+
+```
+
